@@ -25,7 +25,10 @@ class HttpMCPClient:
         # 1. Create instance `cls(mcp_server_url)`
         # 2. Connect to MCP Server (method `connect`)
         # 3. Return created instance
-        raise NotImplementedError()
+        # raise NotImplementedError()
+        mcp_client = cls(mcp_server_url)
+        await mcp_client.connect()
+        return mcp_client
 
     async def connect(self):
         """Connect to MCP server"""
@@ -36,7 +39,13 @@ class HttpMCPClient:
         # 4. Set `self.session: ClientSession` as `await self._session_context.__aenter__()`
         # 5. Call session initialization (initialize method) and assign results to `init_result` variable (initialize is async)
         # 6. Log the `init_result` to see in logs MCP server capabilities
-        raise NotImplementedError()
+        # raise NotImplementedError()
+        self._streams_context = streamablehttp_client(self.server_url)
+        read_stream, write_stream, _ = await self._streams_context.__aenter__()
+        self._session_context = ClientSession(read_stream, write_stream)
+        self.session: ClientSession = await self._session_context.__aenter__()
+        init_result = await self.session.initialize()
+        print(f'init_result: {init_result}')
 
     async def get_tools(self) -> list[dict[str, Any]]:
         """Get available tools from MCP server"""
@@ -47,7 +56,24 @@ class HttpMCPClient:
         #    tool format https://dialx.ai/dial_api#operation/sendChatCompletionRequest (see tools param)
         # 4. Log retrieved tools
         # 5. Return tools dicts list
-        raise NotImplementedError()
+        # raise NotImplementedError()
+
+        if not self.session:
+            raise RuntimeError("HTTP session not initialized")
+
+        tools = await self.session.list_tools()
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema
+                }
+            }
+            for tool in tools.tools
+        ]
+
 
     async def call_tool(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
         """Call a specific tool on the MCP server"""
@@ -58,4 +84,19 @@ class HttpMCPClient:
         # 4. Get tool execution content
         # 5. Get first element from content (it is array with `ContentBlock`)
         # 6. Check if element is instance of TextContent, if yes then return its text, otherwise return retrieved content
-        raise NotImplementedError()
+        # raise NotImplementedError()
+
+        if not self.session:
+            raise RuntimeError("MCP client not connected. Call connect() first.")
+
+        print(f"    Calling `{tool_name}` with {tool_args}")
+
+        tool_result: CallToolResult = await self.session.call_tool(tool_name, tool_args)
+        content = tool_result.content
+
+        print(f"    ⚙️: {content}\n")
+
+        if isinstance(content, TextContent):
+            return content.text
+
+        return content

@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 conversation_manager: Optional[ConversationManager] = None
 
+DIAL_ENDPOINT = "https://ai-proxy.lab.epam.com"
+API_KEY = os.getenv('DIAL_API_KEY')
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,12 +54,48 @@ async def lifespan(app: FastAPI):
     # 8. Create Redis client (redis.Redis). Host is localhost, port is 6379, and decode response
     # 9. ping to redis to check if `its alive (ping method in redis client)
     # 10. Create ConversationManager with DIAL clien and Redis client and assign to `conversation_manager` (global variable)
+    tools: list[dict] = []
+    tool_name_client_map: dict[str, HttpMCPClient|StdioMCPClient] = {}
+
+    mcp_client = await HttpMCPClient.create('http://localhost:8005/mcp')
+    mcp_tools = await mcp_client.get_tools()
+    for tool in mcp_tools:
+        tools.append(tool)
+        function = tool['function']
+        tool_name_client_map[function['name']] = mcp_client
+        logger.info("Registered UMS tool", extra={"tool_name": function['name']})
+
+    duckduckgo_mcp_client = await StdioMCPClient.create(docker_image="khshanovskyi/ddg-mcp-server:latest")
+    for tool in await duckduckgo_mcp_client.get_tools():
+        tools.append(tool)
+        function = tool['function']
+        tool_name_client_map[function['name']] = duckduckgo_mcp_client
+        logger.info("Registered DuckDuckGo tool", extra={"tool_name": function['name']})
+
+    dial_client = DialClient(
+        api_key=API_KEY,
+        endpoint=DIAL_ENDPOINT,
+        model='gpt-4o',
+        tools=tools,
+        tool_name_client_map=tool_name_client_map
+    )
+
+    redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True
+    )
+    await redis_client.ping()
+
+    conversation_manager = ConversationManager(dial_client, redis_client)
+
     yield
 
 
 app = FastAPI(
     #TODO: add `lifespan` param from above, like:
     # - lifespan=lifespan
+    lifespan=lifespan,
 )
 app.add_middleware(
     #TODO:
@@ -65,6 +105,11 @@ app.add_middleware(
     #   - allow_credentials=True
     #   - allow_methods=["*"]
     #   - allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -115,13 +160,106 @@ async def health():
 #    If `request.stream` then return `StreamingResponse(result, media_type="text/event-stream")`, otherwise return `ChatResponse(**result)`
 
 
+@app.post("/conversations")
+async def create_conversation(request: CreateConversationRequest):
+    """Create a new conversation"""
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info("Creating new conversation", extra={"title": request.title})
+    return await conversation_manager.create_conversation(request.title)
+
+
+@app.get("/conversations")
+async def list_conversations():
+    """List all conversations sorted by last update time"""
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.debug("Listing conversations")
+    conversations = await conversation_manager.list_conversations()
+    return [ConversationSummary(**conv) for conv in conversations]
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Get a specific conversation"""
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info("Fetching conversation", extra={"conversation_id": conversation_id})
+    conversation = await conversation_manager.get_conversation(conversation_id)
+
+    if not conversation:
+        logger.warning("Conversation not found", extra={"conversation_id": conversation_id})
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return conversation
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation"""
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info("Deleting conversation", extra={"conversation_id": conversation_id})
+    deleted = await conversation_manager.delete_conversation(conversation_id)
+
+    if not deleted:
+        logger.warning("Conversation not found for deletion", extra={"conversation_id": conversation_id})
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return {"message": "Conversation deleted successfully"}
+
+
+@app.post("/conversations/{conversation_id}/chat")
+async def chat(conversation_id: str, request: ChatRequest):
+    """
+    Chat endpoint that processes messages and returns assistant response.
+    Supports both streaming and non-streaming modes.
+    Automatically saves conversation state.
+    """
+    if not conversation_manager:
+        logger.error("Conversation manager not initialized")
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info(
+        "Chat request received",
+        extra={
+            "conversation_id": conversation_id,
+            "stream": request.stream,
+            "message_role": request.message.role
+        }
+    )
+
+    result = await conversation_manager.chat(
+        user_message=request.message,
+        conversation_id=conversation_id,
+        stream=request.stream
+    )
+
+    if request.stream:
+        logger.debug("Returning streaming response...")
+        return StreamingResponse(
+            result,
+            media_type="text/event-stream"
+        )
+    else:
+        logger.debug("Returning non-streaming response...")
+        return ChatResponse(**result)
+
+
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting UMS Agent server")
     uvicorn.run(
-        #TODO:
-        #  - app
-        #  - host="0.0.0.0"
-        #  - port=8011
-        #  - log_level="debug"
+        app,
+        host="0.0.0.0",
+        port=8011,
+        log_level="debug",
     )
